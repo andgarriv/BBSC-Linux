@@ -3334,6 +3334,15 @@ void MaybeRunBbscReinsert() {
 // armed. The game's own respawn load then runs SummonedMapReload into the host world at the same
 // point the fork's working in-room handoff uses. The request is cleared if it is not consumed.
 constexpr u64 BbscGameTickOffset = 0x01308DC0;
+// 2026-10-17 (BBport for Linux, a guest's summon): the game stopped calling IsValidSos.Update a few
+// seconds into a join (the guest's sign is gone), before the join teleport had placed the guest,
+// and with it every BBSC tick stopped - the load cover's 75 s limit included, so the screen stayed
+// black with no HUD for good. ChairMessenger.RespawnPointNotify.Update runs every frame on the same
+// game thread through all of it; the tick runs from there whenever IsValidSos.Update has not run
+// for BbscGameTickStaleMs.
+constexpr u64 BbscGameTickFallbackOffset = 0x01E5C890;
+constexpr s64 BbscGameTickStaleMs = 250;
+s64 bbsc_game_tick_ms = 0; // the last tick, from either site (the game thread only)
 constexpr s64 BbscRejoinDescriptorTimeoutMs = 20'000;
 std::recursive_mutex bbsc_rejoin_mutex; // hooks may run on different guest threads
 constexpr s64 BbscRejoinDeferredTimeoutMs = 90'000;
@@ -13671,7 +13680,13 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             ArmBbscReinsert();
         }
     }
-    if (site.offset == BbscGameTickOffset) {
+    // The fallback only stands in during a session, once the real tick has run: solo play, the
+    // title and the first load keep their timing.
+    if (site.offset == BbscGameTickOffset ||
+        (site.offset == BbscGameTickFallbackOffset && bbsc_game_tick_ms != 0 &&
+         SteadyNowMs() - bbsc_game_tick_ms > BbscGameTickStaleMs && GetSessionState() >= 3 &&
+         GetSessionState() <= 6)) {
+        bbsc_game_tick_ms = SteadyNowMs();
         bbsc_tick_map.store(GetCurrentPackedMap(), std::memory_order_release);
         TickBbscRelayHostLock();
         TickBbscBossRewards();
