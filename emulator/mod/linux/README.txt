@@ -15,8 +15,9 @@ BBport started the usual way stays without BBSC. Uninstall: ./install.sh --unins
 
 Playing: the host rings the Hunt Bell, the guests the Kin Bell.
 
-Logs (for bug reports, with the launcher's log: Log page > Export):
-  ~/.local/share/bbport/bbsc/logs/
+Logs (send both for a bug report; bbport-*.log ends with how the game ended):
+  ~/.local/share/bbport/bbsc/logs/bbsc-mod-*.log   BBSC
+  ~/.local/share/bbport/bbsc/logs/bbport-*.log     the game (what BBport's Log page shows)
 
 Not on Linux yet: the keyboard/mouse camera (F1) and the F8 unstuck key. The controller camera
 (L3 + R3) works; it also opens BBport's menu.

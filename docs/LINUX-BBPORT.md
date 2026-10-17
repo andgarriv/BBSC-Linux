@@ -59,7 +59,8 @@ example `SHADPS4_BBSC_SCALING=0`.
 ## Check that it runs
 
 Start the game from Bloodborne (BBSC) and look at the newest
-`~/.local/share/bbport/bbsc/logs/bbsc-mod-*.log`:
+`~/.local/share/bbport/bbsc/logs/bbsc-mod-*.log` (the mod's log; `bbport-*.log` next to it is the
+game's own output, ending with how `bb-probe` ended):
 
 - `BBSC mod in pid ... (.../bb-probe)` and `Game image found at 0x800000000`
 - `Bloodborne RE trace installed 159/159 hooks`
@@ -73,11 +74,15 @@ patches already changed; the same on Windows).
 
 Both players: same server and account settings in the launcher, BBSC installed as above, the same
 BBSC build. Host rings the Hunt Bell, the guest the Kin Bell. Then check warps between lamps, a
-boss, a death of each player and the Hunter's Dream. Send both players' `bbsc-mod-*.log` and the
-launcher's log (Log page > Export) for any problem.
+boss, a death of each player and the Hunter's Dream. Send both players' `bbsc-mod-*.log` and
+`bbport-*.log` for any problem.
 
 ## Differences from Windows
 
 - The keyboard and mouse camera (F1) and the F8 unstuck key are Windows only: they use the game
   window's messages. The controller camera (L3 + R3) works; L3 + R3 also opens BBport's menu.
+- Where the desktop portal grants no realtime time (`RTTimeUSecMax` 0 and no rtkit), PipeWire's
+  client module sets the game's `RLIMIT_RTTIME` to 0 and the kernel kills it (SIGKILL) a few
+  minutes in. `bbsc-probe` therefore starts the game with `SDL_AUDIO_DRIVER=pulseaudio,pipewire`
+  and SDL threads without realtime priority, unless those variables are set.
 - Discord status talks to the Discord socket in `$XDG_RUNTIME_DIR` (Flatpak and Snap Discord too).
