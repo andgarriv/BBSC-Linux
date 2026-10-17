@@ -4374,6 +4374,92 @@ bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std
     return true;
 }
 
+// ---- Fall guard (2026-10-17) -------------------------------------------------------------------
+// BBport for Linux (a guest in Hemwick): the join teleport moved the guest 130 m from where the
+// summon load put them, to the host; the floor there was not loaded yet and the guest fell until
+// dead - and the respawn warp to the nearest lamp, 130 m back, did the same. The game loads the
+// floor around where the character is, so a guest who drops well below a BBSC warp's target in the
+// first seconds is put back on the target (the floor there is loading by then); after
+// BbscFallGuardTries the target is reached by a full reload instead, which loads it first.
+constexpr s64 BbscFallGuardMs = 15'000;
+constexpr float BbscFallGuardDrop = 15.0f; // metres below the target: falling, not a ledge
+constexpr int BbscFallGuardTries = 5;
+struct BbscFallGuard {
+    s64 until_ms = 0;
+    s64 last_ms = 0;
+    std::array<float, 4> target{};
+    std::array<float, 4> rotation{};
+    u32 map = 0;
+    int tries = 0;
+    std::string why;
+};
+BbscFallGuard bbsc_fall_guard;
+
+void ArmBbscFallGuard(const std::array<float, 4>& target, const std::array<float, 4>& rotation,
+                      std::string_view why) {
+    bbsc_fall_guard = {};
+    bbsc_fall_guard.until_ms = SteadyNowMs() + BbscFallGuardMs;
+    bbsc_fall_guard.target = target;
+    bbsc_fall_guard.rotation = rotation;
+    bbsc_fall_guard.map = GetCurrentPackedMap();
+    bbsc_fall_guard.why = std::string{why};
+}
+
+void TickBbscFallGuard() {
+    BbscFallGuard& guard = bbsc_fall_guard;
+    const s64 now = SteadyNowMs();
+    if (guard.until_ms == 0 || now - guard.last_ms < 500) {
+        return;
+    }
+    guard.last_ms = now;
+    const u64 global = GetGlobalState();
+    if (now > guard.until_ms || GetCurrentPackedMap() != guard.map ||
+        !ReadablePointer(global, 0x10)) {
+        guard.until_ms = 0; // over, or a load took the guest elsewhere
+        return;
+    }
+    if (ReadValue<u8>(global, 0x08) != 0) {
+        return; // a load is running
+    }
+    const u64 player = GetLocalPlayerCharacter();
+    const auto here = ReadCharacterTransform(player);
+    if (!here.has_value() || GetCharacterHp(player) <= 0 ||
+        here->position[1] > guard.target[1] - BbscFallGuardDrop) {
+        return;
+    }
+    if (guard.tries >= BbscFallGuardTries) {
+        guard.until_ms = 0;
+        SummonPlacementDescriptor to{};
+        to.packed_region = guard.map;
+        to.x = guard.target[0];
+        to.y = guard.target[1];
+        to.z = guard.target[2];
+        to.heading = guard.rotation[1];
+        LOG_WARNING(Debug, "BBSC fall guard ({}): still falling after {} warps back - reloading "
+                           "the map at the target",
+                    guard.why, guard.tries);
+        RequestBbscSessionWarp(global, to, "fall guard");
+        return;
+    }
+    const u64 vtable = ReadValue<u64>(player, 0);
+    const u64 warp = ReadablePointer(vtable, 0x600) ? ReadValue<u64>(vtable, 0x5F8) : 0;
+    if (!IsEbootCodeAddress(warp)) {
+        guard.until_ms = 0;
+        return;
+    }
+    ++guard.tries;
+    alignas(16) std::array<float, 4> position = guard.target;
+    alignas(16) std::array<float, 4> rotation = guard.rotation;
+    position[3] = 1.0f;
+    rotation[3] = 0.0f;
+    using Warp = void PS4_SYSV_ABI (*)(u64 chr, float* position, float* rotation, u32 flag);
+    reinterpret_cast<Warp>(warp)(player, position.data(), rotation.data(), 1);
+    LOG_WARNING(Debug, "BBSC fall guard ({}): fell to y {:.2f} below the target ({:.2f}, {:.2f}, "
+                       "{:.2f}) - put back ({} of {})",
+                guard.why, here->position[1], position[0], position[1], position[2], guard.tries,
+                BbscFallGuardTries);
+}
+
 void TickBbscJoinTeleport() {
     static bool done = false;
     static bool warp_requested = false;
@@ -4489,6 +4575,7 @@ void TickBbscJoinTeleport() {
     using Warp = void PS4_SYSV_ABI (*)(u64 chr, float* position, float* rotation, u32 flag);
     reinterpret_cast<Warp>(warp)(player, position.data(), rotation.data(), 1);
     WriteValue<u8>(player, 0x1E1, static_cast<u8>(ReadValue<u8>(player, 0x1E1) | 0x02));
+    ArmBbscFallGuard(position, rotation, "join teleport");
     LOG_INFO(Debug,
              "BBSC join teleport: guest moved from ({:.2f}, {:.2f}, {:.2f}) to the host at "
              "({:.2f}, {:.2f}, {:.2f})",
@@ -6940,6 +7027,7 @@ bool BbscRespawnInPlace(std::string_view why) {
     using Warp = void PS4_SYSV_ABI (*)(u64 chr, float* position, float* rotation, u32 flag);
     reinterpret_cast<Warp>(warp)(player, position.data(), rotation.data(), 1);
     WriteValue<u8>(player, 0x1E4, static_cast<u8>(ReadValue<u8>(player, 0x1E4) | 0x02));
+    ArmBbscFallGuard(position, rotation, "respawn");
 
     // 3. leave the death animation
     const u64 behaviour = ReadValue<u64>(modules, 0x30);
@@ -13705,6 +13793,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscWorldFlagsBroadcast();
         TickBbscFollowHost();
         TickBbscLoadCover();
+        TickBbscFallGuard();
         TickBbscHpPenalty();
         TickBbscLampRole();
         TickBbscMessages();
