@@ -3141,7 +3141,34 @@ void WriteEnginePanicStack(std::ostream& out, const GuestRegisterSnapshot& regis
             ++found;
         }
     }
-    out << "]}";
+    // The registers a callee keeps, with the first words of what each points at and, for a word
+    // that is itself a pointer, its first word (a vtable): an allocation panic ("Transaction
+    // failed") keeps the container whose heap returned nothing in one of them (2026-10-17).
+    out << "],\"callee_saved\":{";
+    const std::array<std::pair<const char*, u64>, 6> saved{{{"rbx", registers.rbx},
+                                                           {"rbp", registers.rbp},
+                                                           {"r12", registers.r12},
+                                                           {"r13", registers.r13},
+                                                           {"r14", registers.r14},
+                                                           {"r15", registers.r15}}};
+    for (size_t i = 0; i < saved.size(); ++i) {
+        const auto [name, value] = saved[i];
+        out << (i == 0 ? "" : ",") << '"' << name << "\":{\"value\":\"0x" << std::hex << value
+            << "\",\"words\":[";
+        for (u64 word = 0; word < 6; ++word) {
+            if (value < 0x10000 || !HasMemoryAccess(value + word * 8, sizeof(u64), MemoryProt::CpuRead)) {
+                break;
+            }
+            const u64 content = ReadValue<u64>(value, word * 8);
+            out << (word == 0 ? "" : ",") << "\"0x" << content;
+            if (content >= 0x10000 && HasMemoryAccess(content, sizeof(u64), MemoryProt::CpuRead)) {
+                out << "->0x" << ReadValue<u64>(content, 0);
+            }
+            out << '"';
+        }
+        out << "]}" << std::dec;
+    }
+    out << "}}";
 }
 
 // The guest's loads under the death curtain's fade, see "Load cover".

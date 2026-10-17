@@ -98,6 +98,10 @@ ReadDataFn original_read_data = nullptr;
 
 std::mutex state_mutex;
 std::map<int, std::string> request_urls;            // reqId -> URL the request really goes to
+// 2026-10-17 (BBport for Linux): the game panicked ("Transaction failed") while parsing a server
+// reply into its 14 MB network heap. Replies past 64 KiB are logged as they grow (path only).
+std::map<int, u64> request_bytes; // reqId -> reply bytes the game has read
+constexpr u64 LargeReplyBytes = 64 * 1024;
 std::vector<std::pair<std::string, std::string>> overrides; // URL prefix -> server
 std::atomic<bool> stale_cleared{false};
 std::atomic<s64> placement_received_ms{0};
@@ -607,8 +611,171 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
 
 // A sign's reply is a bare {"ResKind":0,"MessageId":"SummonDataCreateResponse"} unless the broker
 // delivers a host's claim with it, which adds the claim's members (the host's UserId among them).
+// ---- Bloodstain replies (2026-10-17) ----------------------------------------------------------
+// BBport for Linux on Seamless Hunt's server: the game panicked ("Transaction failed", DL_PANIC at
+// 0x020B56D2) a second after /tomb_messenger/message_area replies of 64 KiB and more - the
+// bloodstains of a busy area (Central Yharnam), each with its replay. The game parses a reply into
+// its fixed 14 MB network heap (0x0569B168, about 2 MB free in play), and the parsed list needed
+// more than that. The reply is read whole here (the emulator holds it whole already) and only the
+// first bloodstains, up to MaxTombListBytes of the list, reach the game; the rest of the list is
+// blanked with spaces, so the reply keeps its length (Content-Length) and stays valid JSON.
+constexpr std::string_view TombAreaPath = "/tomb_messenger/message_area";
+constexpr size_t MaxTombListBytes = 32 * 1024;
+
+struct HeldReply {
+    std::string body;
+    size_t served = 0;
+};
+std::map<int, HeldReply> held_replies; // reqId -> the trimmed reply the game is reading
+
+// End of the JSON value that starts at `at`, or npos.
+size_t JsonValueEnd(const std::string& text, size_t at) {
+    int depth = 0;
+    bool in_string = false;
+    for (size_t i = at; i < text.size(); ++i) {
+        const char c = text[i];
+        if (in_string) {
+            if (c == '\\') {
+                ++i;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '{' || c == '[') {
+            ++depth;
+        } else if (c == '}' || c == ']') {
+            if (depth == 0) {
+                return i;
+            }
+            if (--depth == 0) {
+                return i + 1;
+            }
+        } else if (c == ',' && depth == 0) {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
+// Blanks the entries of "TombMessList" past MaxTombListBytes. Returns {kept, entries}; {0, 0}
+// when the reply has no such list (it is then left as it is).
+std::pair<size_t, size_t> TrimTombList(std::string& body) {
+    const size_t key = body.find("\"TombMessList\"");
+    const size_t open = key == std::string::npos ? key : body.find('[', key);
+    if (open == std::string::npos) {
+        return {0, 0};
+    }
+    std::vector<size_t> ends;
+    size_t at = open + 1;
+    for (;;) {
+        at = body.find_first_not_of(" \t\r\n", at);
+        if (at == std::string::npos) {
+            return {0, 0};
+        }
+        if (body[at] == ']') {
+            break;
+        }
+        const size_t end = JsonValueEnd(body, at);
+        if (end == std::string::npos) {
+            return {0, 0};
+        }
+        ends.push_back(end);
+        at = body.find_first_not_of(" \t\r\n", end);
+        if (at == std::string::npos || (body[at] != ',' && body[at] != ']')) {
+            return {0, 0};
+        }
+        if (body[at] == ',') {
+            ++at;
+        }
+    }
+    size_t kept = 0;
+    while (kept < ends.size() && ends[kept] - open <= MaxTombListBytes) {
+        ++kept;
+    }
+    if (kept < ends.size()) {
+        const size_t cut = kept == 0 ? open + 1 : ends[kept - 1];
+        std::fill(body.begin() + static_cast<std::ptrdiff_t>(cut),
+                  body.begin() + static_cast<std::ptrdiff_t>(at), ' ');
+    }
+    return {kept, ends.size()};
+}
+
+// A bloodstain reply: read whole and trimmed on the game's first read, then handed out from here.
+int ReadTombReply(int request, void* data, u64 size) {
+    {
+        std::scoped_lock lock{state_mutex};
+        if (const auto it = held_replies.find(request); it != held_replies.end()) {
+            HeldReply& held = it->second;
+            const size_t count =
+                std::min<size_t>(static_cast<size_t>(size), held.body.size() - held.served);
+            if (count != 0 && data != nullptr) {
+                std::memcpy(data, held.body.data() + held.served, count);
+            }
+            held.served += count;
+            return static_cast<int>(count);
+        }
+    }
+    std::string body;
+    std::vector<char> chunk(64 * 1024);
+    for (;;) {
+        const int read = original_read_data(request, chunk.data(), chunk.size());
+        if (read < 0 && body.empty()) {
+            return read;
+        }
+        if (read <= 0) {
+            break;
+        }
+        body.append(chunk.data(), static_cast<size_t>(read));
+    }
+    const size_t length = body.size();
+    if (const auto [kept, entries] = TrimTombList(body); kept < entries) {
+        LOG_WARNING(Mod, "HTTP: bloodstain reply of {} KiB - {} of {} bloodstains kept (the game "
+                         "cannot parse more in its network heap)",
+                    length / 1024, kept, entries);
+    }
+    {
+        std::scoped_lock lock{state_mutex};
+        held_replies[request] = HeldReply{std::move(body), 0};
+    }
+    return ReadTombReply(request, data, size);
+}
+
 int PS4_SYSV_ABI ReadData(int request, void* data, u64 size) {
+    {
+        std::string url;
+        {
+            std::scoped_lock lock{state_mutex};
+            if (const auto it = request_urls.find(request); it != request_urls.end()) {
+                url = it->second;
+            }
+        }
+        if (url.find(TombAreaPath) != std::string::npos) {
+            return ReadTombReply(request, data, size);
+        }
+    }
     const int read = original_read_data(request, data, size);
+    if (read > 0) {
+        std::string url;
+        u64 total = 0;
+        {
+            std::scoped_lock lock{state_mutex};
+            total = request_bytes[request] += static_cast<u64>(read);
+            if (const auto it = request_urls.find(request); it != request_urls.end()) {
+                url = it->second;
+            }
+        }
+        // Logged at 64 KiB, 256 KiB, 1 MiB, ... - before the game parses the reply.
+        for (u64 mark = LargeReplyBytes; mark <= total; mark *= 4) {
+            if (total - static_cast<u64>(read) < mark) {
+                LOG_WARNING(Mod, "HTTP: large reply from {} - {} KiB so far",
+                            url.substr(0, url.find('?')), total / 1024);
+                break;
+            }
+        }
+    }
     if (read > 0 && data != nullptr) {
         std::string url;
         {
@@ -657,6 +824,8 @@ int PS4_SYSV_ABI DeleteRequest(int request) {
     {
         std::scoped_lock lock{state_mutex};
         request_urls.erase(request);
+        request_bytes.erase(request);
+        held_replies.erase(request);
     }
     return original_delete(request);
 }

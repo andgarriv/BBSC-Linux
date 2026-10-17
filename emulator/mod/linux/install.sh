@@ -60,8 +60,10 @@ if [[ ! -x $launcher ]]; then
 fi
 
 mkdir -p "$dest" "${desktop%/*}"
+# A copy next to the old file, then a rename: a game running with the old libbbsc.so keeps it.
 for file in "${files[@]}"; do
-    cp -a -- "$here/$file" "$dest/"
+    cp -a -- "$here/$file" "$dest/.$file.new"
+    mv -f -- "$dest/.$file.new" "$dest/$file"
 done
 dest=$(cd -- "$dest" && pwd)
 {
