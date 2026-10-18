@@ -4384,11 +4384,17 @@ bool RequestBbscSessionWarp(u64 global, const SummonPlacementDescriptor& to, std
 constexpr s64 BbscFallGuardMs = 15'000;
 constexpr float BbscFallGuardDrop = 15.0f; // metres below the target: falling, not a ledge
 constexpr int BbscFallGuardTries = 5;
+// 2026-10-18: a join teleport aimed at a host standing in another map (the summon load had put the
+// guest in the sign's own map) sent the guest into empty space, and the guard kept putting them
+// back there - "floating". After a join teleport, BbscFallGuardJoinTries warps back are tried (the
+// floor may just be loading), then the guest goes back where the summon load put them.
+constexpr int BbscFallGuardJoinTries = 2;
 struct BbscFallGuard {
     s64 until_ms = 0;
     s64 last_ms = 0;
     std::array<float, 4> target{};
     std::array<float, 4> rotation{};
+    std::optional<std::array<float, 4>> fallback; // where the warp started (a join teleport)
     u32 map = 0;
     int tries = 0;
     std::string why;
@@ -4396,11 +4402,13 @@ struct BbscFallGuard {
 BbscFallGuard bbsc_fall_guard;
 
 void ArmBbscFallGuard(const std::array<float, 4>& target, const std::array<float, 4>& rotation,
-                      std::string_view why) {
+                      std::string_view why,
+                      std::optional<std::array<float, 4>> fallback = std::nullopt) {
     bbsc_fall_guard = {};
     bbsc_fall_guard.until_ms = SteadyNowMs() + BbscFallGuardMs;
     bbsc_fall_guard.target = target;
     bbsc_fall_guard.rotation = rotation;
+    bbsc_fall_guard.fallback = fallback;
     bbsc_fall_guard.map = GetCurrentPackedMap();
     bbsc_fall_guard.why = std::string{why};
 }
@@ -4430,6 +4438,26 @@ void TickBbscFallGuard() {
         here->position[1] > guard.target[1] - BbscFallGuardDrop) {
         return;
     }
+    const u64 vtable = ReadValue<u64>(player, 0);
+    const u64 warp = ReadablePointer(vtable, 0x600) ? ReadValue<u64>(vtable, 0x5F8) : 0;
+    if (!IsEbootCodeAddress(warp)) {
+        guard.until_ms = 0;
+        return;
+    }
+    using Warp = void PS4_SYSV_ABI (*)(u64 chr, float* position, float* rotation, u32 flag);
+    if (guard.fallback.has_value() && guard.tries >= BbscFallGuardJoinTries) {
+        guard.until_ms = 0;
+        alignas(16) std::array<float, 4> position = *guard.fallback;
+        alignas(16) std::array<float, 4> rotation = guard.rotation;
+        position[3] = 1.0f;
+        rotation[3] = 0.0f;
+        reinterpret_cast<Warp>(warp)(player, position.data(), rotation.data(), 1);
+        LOG_WARNING(Debug, "BBSC fall guard ({}): still falling - the host's position is not "
+                           "ground in our map (the host is likely in another map); back where the "
+                           "load put us ({:.2f}, {:.2f}, {:.2f})",
+                    guard.why, position[0], position[1], position[2]);
+        return;
+    }
     if (guard.tries >= BbscFallGuardTries) {
         guard.until_ms = 0;
         if (session_state != 6) {
@@ -4447,23 +4475,38 @@ void TickBbscFallGuard() {
         RequestBbscSessionWarp(global, to, "fall guard");
         return;
     }
-    const u64 vtable = ReadValue<u64>(player, 0);
-    const u64 warp = ReadablePointer(vtable, 0x600) ? ReadValue<u64>(vtable, 0x5F8) : 0;
-    if (!IsEbootCodeAddress(warp)) {
-        guard.until_ms = 0;
-        return;
-    }
     ++guard.tries;
     alignas(16) std::array<float, 4> position = guard.target;
     alignas(16) std::array<float, 4> rotation = guard.rotation;
     position[3] = 1.0f;
     rotation[3] = 0.0f;
-    using Warp = void PS4_SYSV_ABI (*)(u64 chr, float* position, float* rotation, u32 flag);
     reinterpret_cast<Warp>(warp)(player, position.data(), rotation.data(), 1);
     LOG_WARNING(Debug, "BBSC fall guard ({}): fell to y {:.2f} below the target ({:.2f}, {:.2f}, "
                        "{:.2f}) - put back ({} of {})",
                 guard.why, here->position[1], position[0], position[1], position[2], guard.tries,
                 BbscFallGuardTries);
+}
+
+// The map a relay host reports when its position is the host character's and that map is not ours:
+// the summon load put the guest in another map than the host's (2026-10-18). 0 = not known (the
+// host is not on the relay, or is in our map).
+u32 BbscHostMapElsewhere(const BbscTransform& host) {
+    const u32 map = GetCurrentPackedMap();
+    const s64 now = SteadyNowMs();
+    std::scoped_lock lock{bbsc_relay_mutex};
+    for (const auto& [sender, seen] : bbsc_relay_hosts) {
+        if (now - seen.ms > BbscRelayHostFreshMs || seen.map == map ||
+            !IsUsablePackedMap(seen.map)) {
+            continue;
+        }
+        const float dx = seen.x - host.position[0];
+        const float dy = seen.y - host.position[1];
+        const float dz = seen.z - host.position[2];
+        if (dx * dx + dy * dy + dz * dz < BbscRelayLockMetres * BbscRelayLockMetres) {
+            return seen.map;
+        }
+    }
+    return 0;
 }
 
 void TickBbscJoinTeleport() {
@@ -4533,6 +4576,27 @@ void TickBbscJoinTeleport() {
         return;
     }
 
+    // The host stands in another map than the one the summon load gave us: one full reload into
+    // the host's map instead of a teleport to coordinates that mean nothing here.
+    if (!warp_requested) {
+        if (const u32 elsewhere = BbscHostMapElsewhere(*host_transform); elsewhere != 0) {
+            SummonPlacementDescriptor to{};
+            to.packed_region = elsewhere;
+            to.x = host_transform->position[0] + 1.0f;
+            to.y = host_transform->position[1];
+            to.z = host_transform->position[2];
+            to.heading = host_transform->rotation[1];
+            LOG_WARNING(Debug, "BBSC join: the host is in map {:#x}, the summon load put us in "
+                               "{:#x} - reloading into the host's map",
+                        elsewhere, GetCurrentPackedMap());
+            if (RequestBbscSessionWarp(global, to, "join")) {
+                warp_requested = true;
+                warp_requested_ms = now;
+                stable_since_ms = 0;
+                return;
+            }
+        }
+    }
     // Let the engine do the transition first, once, then position inside the loaded map.
     // Only after a cross-map join: the one summon load into the host's map left the lighting
     // flickering (lights switching on and off, 2026-09-24) and this second reload fixed it. A
@@ -4581,7 +4645,8 @@ void TickBbscJoinTeleport() {
     using Warp = void PS4_SYSV_ABI (*)(u64 chr, float* position, float* rotation, u32 flag);
     reinterpret_cast<Warp>(warp)(player, position.data(), rotation.data(), 1);
     WriteValue<u8>(player, 0x1E1, static_cast<u8>(ReadValue<u8>(player, 0x1E1) | 0x02));
-    ArmBbscFallGuard(position, rotation, "join teleport");
+    ArmBbscFallGuard(position, rotation, "join teleport",
+                     own.has_value() ? std::optional{own->position} : std::nullopt);
     LOG_INFO(Debug,
              "BBSC join teleport: guest moved from ({:.2f}, {:.2f}, {:.2f}) to the host at "
              "({:.2f}, {:.2f}, {:.2f})",
