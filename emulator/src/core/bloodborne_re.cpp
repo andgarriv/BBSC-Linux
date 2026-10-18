@@ -4413,8 +4413,11 @@ void TickBbscFallGuard() {
     }
     guard.last_ms = now;
     const u64 global = GetGlobalState();
+    // 2026-10-18: a session that ended while the guard was on still got the reload, in the world
+    // the guest was leaving. Out of a session (or after a load elsewhere) the guard stops.
+    const s32 session_state = GetSessionState();
     if (now > guard.until_ms || GetCurrentPackedMap() != guard.map ||
-        !ReadablePointer(global, 0x10)) {
+        !ReadablePointer(global, 0x10) || session_state < 3 || session_state > 6) {
         guard.until_ms = 0; // over, or a load took the guest elsewhere
         return;
     }
@@ -4429,6 +4432,9 @@ void TickBbscFallGuard() {
     }
     if (guard.tries >= BbscFallGuardTries) {
         guard.until_ms = 0;
+        if (session_state != 6) {
+            return; // the reload is the guest's join warp; a host is left to the game
+        }
         SummonPlacementDescriptor to{};
         to.packed_region = guard.map;
         to.x = guard.target[0];

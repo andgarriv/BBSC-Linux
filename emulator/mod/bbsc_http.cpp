@@ -46,6 +46,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <set>
 #include <thread>
 #include <mutex>
 #include <sstream>
@@ -541,6 +542,17 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
         }
     }
     WatchSessionForStaleClaims();
+    // Each request path once per run, so a log shows what the game asked its servers at all
+    // (2026-10-18: signs that never reached the broker, and no line said whether one was sent).
+    {
+        static std::mutex seen_mutex;
+        static std::set<std::string> seen;
+        const std::string path = url.substr(0, url.find('?'));
+        std::scoped_lock lock{seen_mutex};
+        if (seen.insert(path).second) {
+            LOG_INFO(Mod, "HTTP: first request to {} ({} bytes)", path.empty() ? "?" : path, size);
+        }
+    }
     if (!IsSummon(url)) {
         return original_send(request, data, size);
     }
@@ -588,6 +600,13 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
     }
     if (IsSummonCreate(url)) {
         own_sign_created_ms = NowMs();
+        static std::atomic<s64> last_logged{0};
+        if (NowMs() - last_logged.load() > 60'000 && data != nullptr) {
+            last_logged = NowMs();
+            const std::string body(static_cast<const char*>(data), static_cast<size_t>(size));
+            LOG_INFO(Mod, "HTTP: our sign posted (AreaId {}, {} bytes)", JsonNumber(body, "AreaId"),
+                     size);
+        }
     }
     if (IsSummonCreate(url) && data != nullptr && size != 0) {
         std::string body(static_cast<const char*>(data), static_cast<size_t>(size));
@@ -809,6 +828,12 @@ int PS4_SYSV_ABI ReadData(int request, void* data, u64 size) {
         }
         if (IsSummonCreate(url)) {
             const std::string_view reply(static_cast<const char*>(data), static_cast<size_t>(read));
+            const std::string text{reply};
+            const std::string kind = JsonNumber(text, "ResKind");
+            if (!kind.empty() && kind != "0") {
+                LOG_WARNING(Mod, "HTTP: the broker did not take our sign (ResKind {}, {})", kind,
+                            JsonString(text, "MessageId"));
+            }
             if (reply.find("\"UserId\"") != std::string_view::npos &&
                 claim_delivered_ms.exchange(NowMs()) == 0) {
                 LOG_INFO(Mod, "HTTP: a host's claim came with our sign ({} bytes) - waiting for the "
