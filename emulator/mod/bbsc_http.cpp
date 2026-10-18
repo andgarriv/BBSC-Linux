@@ -113,6 +113,10 @@ std::atomic<s64> placement_received_ms{0};
 // Only a player without a sign of its own (or a host, state 3) sends the placement now, and a
 // waiting guest follows one host until that host goes quiet.
 std::atomic<s64> own_sign_created_ms{0};
+// Our UserId / SessionId as the game's sign searches carry them (state_mutex).
+std::string own_user;
+std::string own_session;
+std::atomic<bool> old_record_removed{false};
 std::atomic<s64> own_sign_deleted_ms{0};
 constexpr s64 OwnSignMs = 60'000; // the game posts its sign again about every 30 s
 std::atomic<u32> placement_sender{0};
@@ -443,6 +447,8 @@ u32 Post(const std::string& url, const std::string& body) {
 
 // The broker keeps Preparing/Claimed/Delivered records 15 minutes and Bloodborne reuses its
 // SessionId/UserId after a restart, so the first seamless sign of this run removes any old one.
+void RemoveRecord(const std::string& url, const std::string& session, const std::string& user);
+
 void ClearStaleRecord(const std::string& url, const std::string& body) {
     if (stale_cleared.exchange(true)) {
         return;
@@ -452,9 +458,19 @@ void ClearStaleRecord(const std::string& url, const std::string& body) {
     if (session.empty() || user.empty()) {
         return;
     }
+    RemoveRecord(url, session, user);
+}
+
+// The forced delete of our record, sent to the broker of `url` (any /summon_messenger/ call).
+void RemoveRecord(const std::string& url, const std::string& session, const std::string& user) {
+    const size_t at = url.find("/summon_messenger/");
+    if (at == std::string::npos) {
+        return;
+    }
+    const size_t end = url.find_first_of("/?", at + std::strlen("/summon_messenger/"));
     std::string removal_url = url;
-    removal_url.replace(removal_url.find("/summon_messenger/create"),
-                        std::strlen("/summon_messenger/create"), "/summon_messenger/delete");
+    removal_url.replace(at, (end == std::string::npos ? url.size() : end) - at,
+                        "/summon_messenger/delete");
     const std::string removal = "{\"MessageId\":\"SummonDataRemoveRequest\",\"SessionId\":\"" +
                                 session + "\",\"UserId\":" + user + ",\"Force\":true}";
     // It must finish before the new sign is created (the delete names the same session), so it
@@ -580,6 +596,22 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
         own_sign_deleted_ms = NowMs();
     }
     if (IsSummonSearch(url)) {
+        if (data != nullptr) {
+            const std::string body(static_cast<const char*>(data), static_cast<size_t>(size));
+            const std::string session = JsonString(body, "SessionId");
+            const std::string user = JsonNumber(body, "UserId");
+            std::scoped_lock lock{state_mutex};
+            if (!user.empty() && own_user.empty()) {
+                LOG_INFO(Mod, "HTTP: sign searches as user {}{}", user,
+                         session.empty() ? " (no SessionId in them)" : "");
+            }
+            if (!user.empty()) {
+                own_user = user;
+            }
+            if (!session.empty()) {
+                own_session = session;
+            }
+        }
         const s64 created = own_sign_created_ms.load();
         const bool own_sign_out = SessionState() != 3 && created != 0 &&
                                   created > own_sign_deleted_ms.load() &&
@@ -630,6 +662,41 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
 
 // A sign's reply is a bare {"ResKind":0,"MessageId":"SummonDataCreateResponse"} unless the broker
 // delivers a host's claim with it, which adds the claim's members (the host's UserId among them).
+// ---- Our own old sign (2026-10-18) -------------------------------------------------------------
+// After a join that ended badly the guest's later signs never reached the broker: the game showed
+// its sign but sent no /summon_messenger/create, run after run, so the forced delete before the
+// first create (ClearStaleRecord) never ran either. A sign list that still holds our own UserId
+// while this run has posted no sign holds an old record of ours: it is removed the same way.
+void CheckSignList(const std::string& url, const std::string& reply) {
+    std::string user;
+    std::string session;
+    {
+        std::scoped_lock lock{state_mutex};
+        user = own_user;
+        session = own_session;
+    }
+    size_t signs = 0;
+    for (size_t at = reply.find("\"UserId\""); at != std::string::npos;
+         at = reply.find("\"UserId\"", at + 1)) {
+        ++signs;
+    }
+    const std::string key = "\"UserId\":" + user;
+    const bool ours = !user.empty() && (reply.find(key + ",") != std::string::npos ||
+                                        reply.find(key + "}") != std::string::npos);
+    static std::atomic<s64> last_logged{0};
+    if (NowMs() - last_logged.load() > 60'000 || ours) {
+        last_logged = NowMs();
+        LOG_INFO(Mod, "HTTP: sign list with {} sign(s){}", signs,
+                 ours ? ", our own among them" : "");
+    }
+    if (ours && own_sign_created_ms.load() == 0 && !session.empty() &&
+        !old_record_removed.exchange(true)) {
+        LOG_WARNING(Mod, "HTTP: the broker still lists our own sign though this game posted none - "
+                         "an old record, removed");
+        RemoveRecord(url, session, user);
+    }
+}
+
 // ---- Bloodstain replies (2026-10-17) ----------------------------------------------------------
 // BBport for Linux on Seamless Hunt's server: the game panicked ("Transaction failed", DL_PANIC at
 // 0x020B56D2) a second after /tomb_messenger/message_area replies of 64 KiB and more - the
@@ -825,6 +892,10 @@ int PS4_SYSV_ABI ReadData(int request, void* data, u64 size) {
                 }
                 LOG_INFO(Mod, "HTTP: summon reply ({}, {} bytes): {}", what, read, text);
             }
+        }
+        if (IsSummonSearch(url) && !IsPublicServer(url)) {
+            CheckSignList(url,
+                          std::string(static_cast<const char*>(data), static_cast<size_t>(read)));
         }
         if (IsSummonCreate(url)) {
             const std::string_view reply(static_cast<const char*>(data), static_cast<size_t>(read));
