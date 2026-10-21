@@ -120,6 +120,11 @@ std::atomic<bool> old_record_removed{false};
 std::atomic<s64> own_sign_deleted_ms{0};
 constexpr s64 OwnSignMs = 60'000; // the game posts its sign again about every 30 s
 std::atomic<u32> placement_sender{0};
+// 2026-10-20: the guest followed one host for minutes while it never took the sign, and the other
+// hosts looking for signs were ignored, so the sign stayed in a map where nobody claimed it. A host
+// that has not taken our sign within HostTurnMs of us following it gives way to the next one.
+constexpr s64 HostTurnMs = 60'000;
+std::atomic<s64> placement_followed_ms{0}; // when we started following placement_sender
 std::atomic<s64> claim_delivered_ms{0}; // our sign's reply carried a host's claim (0 = none open)
 std::atomic<bool> was_in_session{false};
 
@@ -975,11 +980,20 @@ void OnHostPlacement(const std::string& placement, u32 sender) {
     if (state == 3 || state == 4 || state == 6) {
         return; // hosting, joining or already a guest
     }
-    // One host at a time: another sender's placement is taken only once ours has gone quiet.
+    // One host at a time: another sender's placement is taken only once ours has gone quiet, or
+    // once ours has had our sign for HostTurnMs without taking it.
     const u32 current = placement_sender.load();
     const s64 received = placement_received_ms.load();
-    if (current != 0 && current != sender && received != 0 &&
+    const s64 followed = placement_followed_ms.load();
+    const s64 created = own_sign_created_ms.load();
+    const bool turn_over = created > followed && created > own_sign_deleted_ms.load() &&
+                           claim_delivered_ms.load() == 0 && NowMs() - followed > HostTurnMs;
+    if (current != 0 && current != sender && received != 0 && turn_over &&
         NowMs() - received <= PlacementStaleMs) {
+        LOG_INFO(Mod, "HTTP: host {:08x} has not taken our sign in {} s - trying host {:08x}",
+                 current, (NowMs() - followed) / 1000, sender);
+    } else if (current != 0 && current != sender && received != 0 &&
+               NowMs() - received <= PlacementStaleMs) {
         static std::atomic<s64> last_logged{0};
         if (NowMs() - last_logged.load() > 30'000) {
             last_logged = NowMs();
@@ -991,6 +1005,7 @@ void OnHostPlacement(const std::string& placement, u32 sender) {
     }
     if (Core::Bloodborne::SetSeamlessHostPlacementHeader(placement)) {
         if (placement_sender.exchange(sender) != sender) {
+            placement_followed_ms = NowMs();
             LOG_INFO(Mod, "HTTP: following host {:08x} for the sign's map", sender);
         }
         // "1,<map>,x,y,z,heading,area": the map is logged whenever it changes (2026-10-07: the
