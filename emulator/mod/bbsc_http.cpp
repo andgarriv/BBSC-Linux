@@ -888,6 +888,27 @@ int PS4_SYSV_ABI ReadData(int request, void* data, u64 size) {
                 url = it->second;
             }
         }
+        // Seamless servers (2026-10-23, solo hosting test): the log said a search went out, not
+        // whether the broker answered it. Once a minute: how many replies, their ResKind and how
+        // many signs the last list held (no sign contents).
+        if (IsSummonSearch(url) && !IsPublicServer(url)) {
+            static std::atomic<int> replies{0};
+            static std::atomic<s64> last_logged{0};
+            ++replies;
+            if (NowMs() - last_logged.load() > 60'000) {
+                last_logged = NowMs();
+                const std::string text(static_cast<const char*>(data), static_cast<size_t>(read));
+                size_t signs = 0;
+                for (size_t at = text.find("\"UserId\""); at != std::string::npos;
+                     at = text.find("\"UserId\"", at + 1)) {
+                    ++signs;
+                }
+                const std::string kind = JsonNumber(text, "ResKind");
+                LOG_INFO(Mod, "HTTP: sign search replies: {} since the last line, ResKind {}, {} "
+                              "sign(s) in the last list",
+                         replies.exchange(0), kind.empty() ? "?" : kind, signs);
+            }
+        }
         // Public servers (2026-10-10: a host's summon never reached the guest on The Hunter's
         // Dream): every summon reply that is not a bare create answer goes into the log.
         if (IsSummon(url) && IsPublicServer(url)) {
