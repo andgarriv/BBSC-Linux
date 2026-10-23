@@ -86,3 +86,9 @@ boss, a death of each player and the Hunter's Dream. Send both players' `bbsc-mo
   minutes in. `bbsc-probe` therefore starts the game with `SDL_AUDIO_DRIVER=pulseaudio,pipewire`
   and SDL threads without realtime priority, unless those variables are set.
 - Discord status talks to the Discord socket in `$XDG_RUNTIME_DIR` (Flatpak and Snap Discord too).
+- Watching another hunter while dead (0.0.2): on Linux only the controller switches hunters
+  (R1 / L1); the Tab / E / Q / F / mouse keys read the game window and are Windows only.
+- The Windows 0.0.2 package ships a patched BBport (`bbport/bbport-1.7.2-bbsc.patch`: UDP 3478
+  relay fallback, signaling rejoin fix, NpUtility). The Linux package runs the stock BBport
+  AppImage, without those network fixes; the mod side (aimed host placement, safe import slots,
+  area list cap, timeline) is the same.

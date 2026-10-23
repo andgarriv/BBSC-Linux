@@ -18,10 +18,14 @@
 //   - URLs: the entries of host_overrides.json (same file and format as the emulator's) are
 //     applied here too, so a stock emulator reaches the BBSC game server and summon broker.
 //   - /summon_messenger/*: header X-ShadPS4-Bloodborne-Seamless: 1 (the broker's seamless mode).
-//   - summon search/request (a host looking for signs): the host's placement header, as the
-//     emulator sent it, AND the same text to every other player through the BBSC relay - the game
+//   - summon request (a host ringing one sign): the host's placement header, AND the same text
+//     through the BBSC relay aimed at that sign's UserId only (TargetUserId of the claim) - the game
 //     does not import sceHttpGetAllResponseHeaders, so the guest cannot read it from the broker's
-//     reply; the relay brings it instead (bbsc_relay.cpp -> BbscMod::OnHostPlacement).
+//     reply; the relay brings it instead (bbsc_relay.cpp -> BbscMod::OnAimedHostPlacement).
+//     0.0.1 hotfix (2026-10-13): the search (/get) goes out unchanged. A search with a placement made the
+//     broker lock every sign outside the host's map ("Preparing") for that host, and the 0.0.1
+//     relay broadcast made waiting guests follow random hosts - on the public server nobody's
+//     Kin Bell sign could be rung.
 //   - summon create (a guest's sign): the AreaId becomes the host's map once a host's placement
 //     is known (connect-first), and the first seamless create of this run sends a forced delete
 //     for the same SessionId/UserId first (stale broker record after a crash).
@@ -43,7 +47,9 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <set>
@@ -60,9 +66,14 @@
 #include "common/types.h"
 #include "core/bloodborne_re.h"
 
+// One line in this run's BBSC timeline (bloodborne_re.cpp, "Timeline").
+#define BBSC_TIMELINE(kind, ...) Core::Bloodborne::BbscTimelineEvent(kind, fmt::format(__VA_ARGS__))
+
 namespace BbscMod {
-void RelaySendPlacement(const std::string& placement);
+void RelaySendAimedPlacement(s64 target_user, const std::string& placement);
 u64 EbootAddress(); // bbsc_mod.cpp: where the game image is (0 until found)
+bool ReadSlotSafely(u64 address, u64* value);  // bbsc_mod.cpp: no fault if unreadable
+bool WriteSlotSafely(u64 address, u64 value);
 void GuardSlot(u64 slot_offset, u64 wrapper, void** original, const char* name); // bbsc_mod.cpp
 }
 
@@ -80,6 +91,9 @@ constexpr u64 SlotReadData = 0x053E5668;
 // works; one that has not after this long is a dead claim.
 constexpr s64 ClaimJoinWaitMs = 20'000;
 constexpr s64 PlacementStaleMs = 20'000;
+// An aimed placement (0.0.1 hotfix) comes once per claim; the game re-posts its sign about every 30 s,
+// so it has to outlive that re-post.
+constexpr s64 AimedPlacementStaleMs = 90'000;
 
 using CreateConnectionFn = int PS4_SYSV_ABI (*)(int, const char*, bool);
 using CreateRequestFn = int PS4_SYSV_ABI (*)(int, s32, const char*, u64);
@@ -113,20 +127,13 @@ std::atomic<s64> placement_received_ms{0};
 // Only a player without a sign of its own (or a host, state 3) sends the placement now, and a
 // waiting guest follows one host until that host goes quiet.
 std::atomic<s64> own_sign_created_ms{0};
-// Our UserId / SessionId as the game's sign searches carry them (state_mutex).
-std::string own_user;
-std::string own_session;
-std::atomic<bool> old_record_removed{false};
 std::atomic<s64> own_sign_deleted_ms{0};
 constexpr s64 OwnSignMs = 60'000; // the game posts its sign again about every 30 s
 std::atomic<u32> placement_sender{0};
-// 2026-10-20: the guest followed one host for minutes while it never took the sign, and the other
-// hosts looking for signs were ignored, so the sign stayed in a map where nobody claimed it. A host
-// that has not taken our sign within HostTurnMs of us following it gives way to the next one.
-constexpr s64 HostTurnMs = 60'000;
-std::atomic<s64> placement_followed_ms{0}; // when we started following placement_sender
 std::atomic<s64> claim_delivered_ms{0}; // our sign's reply carried a host's claim (0 = none open)
 std::atomic<bool> was_in_session{false};
+std::atomic<s64> own_user_id{0};          // UserId of our own sign (from its /create body)
+std::atomic<bool> placement_aimed{false}; // the placement came aimed at our sign
 
 s64 NowMs() {
     return static_cast<s64>(BbscMod::Platform::NowMs());
@@ -173,11 +180,15 @@ void LoadOverrides() {
             overrides.emplace_back(strings[i], strings[i + 1]);
         }
         if (!overrides.empty()) {
-            LOG_INFO(Mod, "HTTP: {} URL override(s) from host_overrides.json", overrides.size());
+            LOG_INFO(Mod, "HTTP: {} URL override(s) from {}", overrides.size(),
+                     std::filesystem::path(path).string());
+            BBSC_TIMELINE("START", "HTTP: {} URL override(s) from {}", overrides.size(),
+                     std::filesystem::path(path).string());
             return;
         }
     }
     LOG_INFO(Mod, "HTTP: no host_overrides.json - URLs unchanged");
+    BBSC_TIMELINE("START", "HTTP: no host_overrides.json - URLs unchanged");
 }
 
 // 0.0.0.0 is a server's "listen on everything", never an address to connect to. A game server
@@ -261,8 +272,11 @@ bool IsSummonDelete(const std::string& url) {
     return Contains(url, "/summon_messenger/delete");
 }
 
+bool IsSummonClaim(const std::string& url) {
+    return Contains(url, "/summon_messenger/request");
+}
 bool IsSummonSearch(const std::string& url) {
-    return Contains(url, "/summon_messenger/request") || Contains(url, "/summon_messenger/get");
+    return Contains(url, "/summon_messenger/get");
 }
 
 // Public servers (2026-10-09): The Hunter's Dream (and the other community servers) let mods in as
@@ -483,6 +497,8 @@ void RemoveRecord(const std::string& url, const std::string& session, const std:
     const u32 status = Post(removal_url, removal);
     LOG_INFO(Mod, "HTTP: stale summon cleanup for session {} user {}: status {}", session, user,
              status);
+    BBSC_TIMELINE("JOIN", "HTTP: stale summon cleanup for session {} user {}: status {}", session, user,
+             status);
 }
 
 // ---- Stuck claims (2026-10-06) -------------------------------------------------------------------
@@ -510,6 +526,7 @@ void WatchSessionForStaleClaims() {
         was_in_session = true;
         if (claim_delivered_ms.exchange(0) != 0) {
             LOG_INFO(Mod, "HTTP: the delivered claim became a join (session state {})", state);
+            BBSC_TIMELINE("JOIN", "HTTP: the delivered claim became a join (session state {})", state);
         }
         return;
     }
@@ -519,12 +536,16 @@ void WatchSessionForStaleClaims() {
     if (was_in_session.exchange(false)) {
         stale_cleared = false;
         LOG_INFO(Mod, "HTTP: session over - the next sign first clears our old broker record");
+        BBSC_TIMELINE("JOIN", "HTTP: session over - the next sign first clears our old broker record");
     }
     const s64 delivered = claim_delivered_ms.load();
     if (delivered != 0 && NowMs() - delivered > ClaimJoinWaitMs) {
         claim_delivered_ms = 0;
         stale_cleared = false;
         LOG_WARNING(Mod, "HTTP: a host's claim was delivered {} s ago and never became a join - "
+                         "the next sign first clears it",
+                    (NowMs() - delivered) / 1000);
+        BBSC_TIMELINE("JOIN", "HTTP: a host's claim was delivered {} s ago and never became a join - "
                          "the next sign first clears it",
                     (NowMs() - delivered) / 1000);
     }
@@ -550,7 +571,10 @@ int PS4_SYSV_ABI CreateRequestWithURL(int connection, s32 method, const char* ur
 // A slot's value when it holds an emulator function (outside the eboot), else 0.
 u64 CurrentSlot(u64 slot_offset) {
     const u64 base = BbscMod::EbootAddress();
-    const u64 value = BbscMod::Platform::ReadSlot(base + slot_offset);
+    u64 value = 0;
+    if (!BbscMod::ReadSlotSafely(base + slot_offset, &value)) {
+        return 0;
+    }
     return value != 0 && (value < base || value >= base + EbootSize) ? value : 0;
 }
 
@@ -574,6 +598,22 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
             LOG_INFO(Mod, "HTTP: first request to {} ({} bytes)", path.empty() ? "?" : path, size);
         }
     }
+    // Fewer messages / bloodstains per list (Panic 265 at Gascoigne / Cathedral Ward, see
+    // CapBbscAreaListRequest). Not on public servers: their API calls go out unchanged.
+    if (Contains(url, "/message_area") && !IsPublicServer(url) && data != nullptr && size != 0) {
+        if (const u64 length = CurrentSlot(SlotSetContentLength); length != 0) {
+            original_set_content_length = reinterpret_cast<SetContentLengthFn>(length);
+        }
+        std::string body(static_cast<const char*>(data), static_cast<size_t>(size));
+        const std::string changed = Core::Bloodborne::CapBbscAreaListRequest(url, body);
+        if (!changed.empty() && original_set_content_length != nullptr) {
+            original_set_content_length(request, body.size());
+            LOG_INFO(Mod, "HTTP: {}", changed);
+            // The emulator copies the body during the call, so a local buffer is fine.
+            return original_send(request, body.data(), body.size());
+        }
+        return original_send(request, data, size);
+    }
     if (!IsSummon(url)) {
         return original_send(request, data, size);
     }
@@ -581,6 +621,8 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true)) {
             LOG_INFO(Mod, "HTTP: summon requests go to a public server - sent unchanged (no "
+                          "seamless headers, connect-first or cleanup)");
+            BBSC_TIMELINE("NET", "HTTP: summon requests go to a public server - sent unchanged (no "
                           "seamless headers, connect-first or cleanup)");
         }
         return original_send(request, data, size);
@@ -600,40 +642,38 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
     if (IsSummonDelete(url)) {
         own_sign_deleted_ms = NowMs();
     }
-    if (IsSummonSearch(url)) {
-        if (data != nullptr) {
-            const std::string body(static_cast<const char*>(data), static_cast<size_t>(size));
-            const std::string session = JsonString(body, "SessionId");
-            const std::string user = JsonNumber(body, "UserId");
-            std::scoped_lock lock{state_mutex};
-            if (!user.empty() && own_user.empty()) {
-                LOG_INFO(Mod, "HTTP: sign searches as user {}{}", user,
-                         session.empty() ? " (no SessionId in them)" : "");
-            }
-            if (!user.empty()) {
-                own_user = user;
-            }
-            if (!session.empty()) {
-                own_session = session;
-            }
-        }
-        const s64 created = own_sign_created_ms.load();
-        const bool own_sign_out = SessionState() != 3 && created != 0 &&
-                                  created > own_sign_deleted_ms.load() &&
-                                  NowMs() - created < OwnSignMs;
-        if (own_sign_out) {
-            static std::atomic<s64> last_logged{0};
-            if (NowMs() - last_logged.load() > 60'000) {
-                last_logged = NowMs();
-                LOG_INFO(Mod, "HTTP: sign search while our own sign is out - no host placement "
-                              "sent (we are waiting, not hosting)");
-            }
-        } else if (const auto placement = Core::Bloodborne::GetSeamlessHostPlacementHeader()) {
+    if (IsSummonClaim(url)) {
+        // The host rang one sign: the broker gets our placement with the claim and only that
+        // sign's player hears it over the relay (it moves its sign into our map, then the broker
+        // delivers). Without a target nothing is sent - a claim with a placement nobody follows
+        // would stay "Claimed" until it times out.
+        const std::string body = data != nullptr && size != 0
+                                     ? std::string(static_cast<const char*>(data),
+                                                   static_cast<size_t>(size))
+                                     : std::string{};
+        const std::string target_text = JsonNumber(body, "TargetUserId");
+        const s64 target = target_text.empty() ? 0 : std::atoll(target_text.c_str());
+        const auto placement = Core::Bloodborne::GetSeamlessHostPlacementHeader();
+        if (target > 0 && placement) {
             original_add_header(request, "X-ShadPS4-Bloodborne-Host-Placement", placement->c_str(),
                                 0);
-            BbscMod::RelaySendPlacement(*placement);
+            BbscMod::RelaySendAimedPlacement(target, *placement);
+            LOG_INFO(Mod, "HTTP: ringing the sign of user {} - our placement {} sent to it", target,
+                     *placement);
+            BBSC_TIMELINE("JOIN", "HTTP: ringing the sign of user {} - our placement {} sent to it", target,
+                     *placement);
+        } else {
+            LOG_INFO(Mod, "HTTP: ringing a sign - no placement sent (target user {}, placement {})",
+                     target_text.empty() ? std::string("unknown") : target_text,
+                     placement ? "known" : "none");
+            BBSC_TIMELINE("JOIN", "HTTP: ringing a sign - no placement sent (target user {}, placement {})",
+                     target_text.empty() ? std::string("unknown") : target_text,
+                     placement ? "known" : "none");
         }
         return original_send(request, data, size);
+    }
+    if (IsSummonSearch(url)) {
+        return original_send(request, data, size); // searches go out unchanged (0.0.1 hotfix)
     }
     if (IsSummonCreate(url)) {
         own_sign_created_ms = NowMs();
@@ -648,11 +688,19 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
     if (IsSummonCreate(url) && data != nullptr && size != 0) {
         std::string body(static_cast<const char*>(data), static_cast<size_t>(size));
         ClearStaleRecord(url, body);
+        if (const std::string user = JsonNumber(body, "UserId"); !user.empty()) {
+            const s64 id = std::atoll(user.c_str());
+            if (own_user_id.exchange(id) != id) {
+                LOG_INFO(Mod, "HTTP: our sign's user id is {}", id);
+            }
+        }
         // A host's placement that has not been refreshed for a while is a host that stopped
         // looking: forget it, as the emulator did when a create reply carried none.
         const s64 received = placement_received_ms.load();
-        if (received != 0 && NowMs() - received > PlacementStaleMs) {
+        const s64 stale = placement_aimed.load() ? AimedPlacementStaleMs : PlacementStaleMs;
+        if (received != 0 && NowMs() - received > stale) {
             placement_received_ms = 0;
+            placement_aimed = false;
             placement_sender = 0;
             Core::Bloodborne::ClearSeamlessHostPlacementHeader();
         }
@@ -663,43 +711,6 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
         }
     }
     return original_send(request, data, size);
-}
-
-// A sign's reply is a bare {"ResKind":0,"MessageId":"SummonDataCreateResponse"} unless the broker
-// delivers a host's claim with it, which adds the claim's members (the host's UserId among them).
-// ---- Our own old sign (2026-10-18) -------------------------------------------------------------
-// After a join that ended badly the guest's later signs never reached the broker: the game showed
-// its sign but sent no /summon_messenger/create, run after run, so the forced delete before the
-// first create (ClearStaleRecord) never ran either. A sign list that still holds our own UserId
-// while this run has posted no sign holds an old record of ours: it is removed the same way.
-void CheckSignList(const std::string& url, const std::string& reply) {
-    std::string user;
-    std::string session;
-    {
-        std::scoped_lock lock{state_mutex};
-        user = own_user;
-        session = own_session;
-    }
-    size_t signs = 0;
-    for (size_t at = reply.find("\"UserId\""); at != std::string::npos;
-         at = reply.find("\"UserId\"", at + 1)) {
-        ++signs;
-    }
-    const std::string key = "\"UserId\":" + user;
-    const bool ours = !user.empty() && (reply.find(key + ",") != std::string::npos ||
-                                        reply.find(key + "}") != std::string::npos);
-    static std::atomic<s64> last_logged{0};
-    if (NowMs() - last_logged.load() > 60'000 || ours) {
-        last_logged = NowMs();
-        LOG_INFO(Mod, "HTTP: sign list with {} sign(s){}", signs,
-                 ours ? ", our own among them" : "");
-    }
-    if (ours && own_sign_created_ms.load() == 0 && !session.empty() &&
-        !old_record_removed.exchange(true)) {
-        LOG_WARNING(Mod, "HTTP: the broker still lists our own sign though this game posted none - "
-                         "an old record, removed");
-        RemoveRecord(url, session, user);
-    }
 }
 
 // ---- Bloodstain replies (2026-10-17) ----------------------------------------------------------
@@ -834,6 +845,8 @@ int ReadTombReply(int request, void* data, u64 size) {
     return ReadTombReply(request, data, size);
 }
 
+// A sign's reply is a bare {"ResKind":0,"MessageId":"SummonDataCreateResponse"} unless the broker
+// delivers a host's claim with it, which adds the claim's members (the host's UserId among them).
 int PS4_SYSV_ABI ReadData(int request, void* data, u64 size) {
     {
         std::string url;
@@ -898,10 +911,6 @@ int PS4_SYSV_ABI ReadData(int request, void* data, u64 size) {
                 LOG_INFO(Mod, "HTTP: summon reply ({}, {} bytes): {}", what, read, text);
             }
         }
-        if (IsSummonSearch(url) && !IsPublicServer(url)) {
-            CheckSignList(url,
-                          std::string(static_cast<const char*>(data), static_cast<size_t>(read)));
-        }
         if (IsSummonCreate(url)) {
             const std::string_view reply(static_cast<const char*>(data), static_cast<size_t>(read));
             const std::string text{reply};
@@ -913,6 +922,9 @@ int PS4_SYSV_ABI ReadData(int request, void* data, u64 size) {
             if (reply.find("\"UserId\"") != std::string_view::npos &&
                 claim_delivered_ms.exchange(NowMs()) == 0) {
                 LOG_INFO(Mod, "HTTP: a host's claim came with our sign ({} bytes) - waiting for the "
+                              "join",
+                         read);
+                BBSC_TIMELINE("JOIN", "HTTP: a host's claim came with our sign ({} bytes) - waiting for the "
                               "join",
                          read);
             }
@@ -938,10 +950,14 @@ template <typename Fn>
 bool Swap(u64 slot_offset, Fn wrapper, Fn& original, const char* name) {
     const u64 slot = BbscMod::EbootAddress() + slot_offset;
     for (int i = 0; i < 60'000; ++i) {
-        const u64 value = BbscMod::Platform::ReadSlot(slot);
-        if (value != 0 && (value < BbscMod::EbootAddress() || value >= BbscMod::EbootAddress() + EbootSize)) {
+        u64 value = 0;
+        if (BbscMod::ReadSlotSafely(slot, &value) && value != 0 &&
+            (value < BbscMod::EbootAddress() || value >= BbscMod::EbootAddress() + EbootSize)) {
             original = reinterpret_cast<Fn>(value);
-            BbscMod::Platform::WriteSlot(slot, reinterpret_cast<u64>(wrapper));
+            if (!BbscMod::WriteSlotSafely(slot, reinterpret_cast<u64>(wrapper))) {
+                BbscMod::Platform::SleepMs(1);
+                continue; // page not writable right now: try again
+            }
             BbscMod::GuardSlot(slot_offset, reinterpret_cast<u64>(wrapper),
                                reinterpret_cast<void**>(&original), name);
             return true;
@@ -955,8 +971,9 @@ bool Swap(u64 slot_offset, Fn wrapper, Fn& original, const char* name) {
 u64 WaitForSlot(u64 slot_offset) {
     const u64 slot = BbscMod::EbootAddress() + slot_offset;
     for (int i = 0; i < 60'000; ++i) {
-        const u64 value = BbscMod::Platform::ReadSlot(slot);
-        if (value != 0 && (value < BbscMod::EbootAddress() || value >= BbscMod::EbootAddress() + EbootSize)) {
+        u64 value = 0;
+        if (BbscMod::ReadSlotSafely(slot, &value) && value != 0 &&
+            (value < BbscMod::EbootAddress() || value >= BbscMod::EbootAddress() + EbootSize)) {
             return value;
         }
         BbscMod::Platform::SleepMs(1);
@@ -976,48 +993,40 @@ bool IsPublicServerAddress(const std::string& url_or_host) {
 // A host's placement from the relay: what the broker's reply header carried in the emulator
 // build. Used only by a player who is not in a session yet (a guest waiting to be summoned).
 void OnHostPlacement(const std::string& placement, u32 sender) {
+    // Older hosts sent their placement to everyone whenever they searched; waiting guests then
+    // followed random hosts. Now we only follows a placement aimed at our own sign.
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+        LOG_INFO(Mod, "HTTP: placement broadcast from {:08x} ignored (an old host - it must "
+                      "update BBSC): {}",
+                 sender, placement);
+        BBSC_TIMELINE("JOIN", "HTTP: placement broadcast from {:08x} ignored (an old host - it must "
+                      "update BBSC): {}",
+                 sender, placement);
+    }
+}
+
+// A host rang our sign (0.0.1 hotfix): its placement, aimed at our sign's UserId. The next post of our
+// sign moves it into the host's map and the broker delivers the claim.
+void OnAimedHostPlacement(s64 target_user, const std::string& placement, u32 sender) {
+    const s64 own = own_user_id.load();
+    if (own == 0 || target_user != own) {
+        return; // another player's sign was rung
+    }
     const s32 state = SessionState();
     if (state == 3 || state == 4 || state == 6) {
         return; // hosting, joining or already a guest
     }
-    // One host at a time: another sender's placement is taken only once ours has gone quiet, or
-    // once ours has had our sign for HostTurnMs without taking it.
-    const u32 current = placement_sender.load();
-    const s64 received = placement_received_ms.load();
-    const s64 followed = placement_followed_ms.load();
-    const s64 created = own_sign_created_ms.load();
-    const bool turn_over = created > followed && created > own_sign_deleted_ms.load() &&
-                           claim_delivered_ms.load() == 0 && NowMs() - followed > HostTurnMs;
-    if (current != 0 && current != sender && received != 0 && turn_over &&
-        NowMs() - received <= PlacementStaleMs) {
-        LOG_INFO(Mod, "HTTP: host {:08x} has not taken our sign in {} s - trying host {:08x}",
-                 current, (NowMs() - followed) / 1000, sender);
-    } else if (current != 0 && current != sender && received != 0 &&
-               NowMs() - received <= PlacementStaleMs) {
-        static std::atomic<s64> last_logged{0};
-        if (NowMs() - last_logged.load() > 30'000) {
-            last_logged = NowMs();
-            LOG_INFO(Mod, "HTTP: placement from another player {:08x} ignored - following host "
-                          "{:08x}",
-                     sender, current);
-        }
-        return;
-    }
+    // Its world flags are taken before the join load (bloodborne_re.cpp, "the host that rang").
+    Core::Bloodborne::NoteBbscHostRangOurSign(sender);
     if (Core::Bloodborne::SetSeamlessHostPlacementHeader(placement)) {
-        if (placement_sender.exchange(sender) != sender) {
-            placement_followed_ms = NowMs();
-            LOG_INFO(Mod, "HTTP: following host {:08x} for the sign's map", sender);
-        }
-        // "1,<map>,x,y,z,heading,area": the map is logged whenever it changes (2026-10-07: the
-        // third player's sign stayed on a map the host had left; only the first one was logged).
-        static std::string last_map;
-        const size_t a = placement.find(',');
-        const size_t b = a == std::string::npos ? a : placement.find(',', a + 1);
-        const std::string map = b == std::string::npos ? std::string{} : placement.substr(a + 1, b - a - 1);
-        if (placement_received_ms.exchange(NowMs()) == 0 || map != last_map) {
-            LOG_INFO(Mod, "HTTP: a host is looking for signs - placement {}", placement);
-        }
-        last_map = map;
+        placement_sender = sender;
+        placement_aimed = true;
+        placement_received_ms = NowMs();
+        LOG_INFO(Mod, "HTTP: host {:08x} rang our sign (user {}) - placement {}", sender, own,
+                 placement);
+        BBSC_TIMELINE("JOIN", "HTTP: host {:08x} rang our sign (user {}) - placement {}", sender, own,
+                 placement);
     }
 }
 
@@ -1037,6 +1046,9 @@ void InstallHttpWrappers() {
                     original_set_content_length && original_send && original_delete &&
                     original_read_data;
     LOG_INFO(Mod, "HTTP: game's HTTP calls {} (URL overrides, seamless summon, connect-first, stale "
+                  "cleanup)",
+             ok ? "wrapped" : "NOT wrapped - an import slot was never filled");
+    BBSC_TIMELINE("START", "HTTP: game's HTTP calls {} (URL overrides, seamless summon, connect-first, stale "
                   "cleanup)",
              ok ? "wrapped" : "NOT wrapped - an import slot was never filled");
 }

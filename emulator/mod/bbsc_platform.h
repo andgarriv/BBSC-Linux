@@ -37,9 +37,14 @@ std::filesystem::path ProgramPath(); // the host: shadPS4.exe, bb-probe...
 std::FILE* OpenFile(const std::filesystem::path& path, const char* mode);
 void SetEnv(const char* name, const char* value);
 
-// Where host_overrides.json may be, most specific first: the file the host names in
-// SHADPS4_HTTP_HOST_OVERRIDES_JSON (shadPS4's own rule; BBport's run.sh / run.py set it), then the
-// host's user folders.
+// Where host_overrides.json may be, in the order the emulator looks for it:
+// 1. SHADPS4_HTTP_HOST_OVERRIDES_JSON - BBport (run.sh / run.py) passes the file it uses this way:
+//    its own user/host_overrides.custom.json when present, else a user/host_overrides.json it
+//    writes for The Hunter's Dream (2026-10-13 public reports: 0.0.1 read only the second).
+// 2. user/host_overrides.custom.json (BBport layout) in the start folder, beside the program or
+//    one folder up.
+// 3. user/host_overrides.json in the start folder / beside the program (portable), then (Windows)
+//    %APPDATA%\shadPS4.
 std::vector<std::filesystem::path> HostOverridesFiles();
 
 #ifndef _WIN32
@@ -69,9 +74,12 @@ bool QueryRegion(u64 address, Region& out);
 bool MakeWritableCode(u64 address, u64 size);
 // Writes code bytes: made writable for the copy, then the old protection is put back.
 bool WriteCode(u64 address, const void* bytes, size_t size);
+#ifndef _WIN32
 // An 8-byte import slot: read so that a page that changes under us cannot fault, written as above.
-u64 ReadSlot(u64 address);
-void WriteSlot(u64 address, u64 value);
+// False while the page is unmapped or unreadable (Windows: ReadSlotSafely in bbsc_mod.cpp).
+bool ReadSlot(u64 address, u64* value);
+bool WriteSlot(u64 address, u64 value);
+#endif
 // size bytes of read/write/execute memory at exactly address, or nullptr.
 void* MapCodeAt(u64 address, u64 size);
 void FlushCode(const void* address, size_t size);
@@ -136,14 +144,18 @@ inline void SetEnv(const char* name, const char* value) {
 
 inline std::vector<std::filesystem::path> HostOverridesFiles() {
     std::vector<std::filesystem::path> files;
-    if (const char* named = std::getenv("SHADPS4_HTTP_HOST_OVERRIDES_JSON"); named && named[0]) {
+    if (const wchar_t* named = _wgetenv(L"SHADPS4_HTTP_HOST_OVERRIDES_JSON"); named && named[0]) {
         files.emplace_back(named);
     }
-    // The emulator's own rule: a "user" folder in the folder it was started in wins (portable).
     wchar_t cwd[MAX_PATH]{};
     GetCurrentDirectoryW(MAX_PATH, cwd);
-    files.push_back(std::filesystem::path{cwd} / L"user" / L"host_overrides.json");
-    files.push_back(ProgramPath().parent_path() / L"user" / L"host_overrides.json");
+    const std::filesystem::path start{cwd};
+    const std::filesystem::path dir = ProgramPath().parent_path();
+    for (const auto& base : {start, dir, dir.parent_path()}) {
+        files.push_back(base / L"user" / L"host_overrides.custom.json");
+    }
+    files.push_back(start / L"user" / L"host_overrides.json");
+    files.push_back(dir / L"user" / L"host_overrides.json");
     if (const wchar_t* appdata = _wgetenv(L"APPDATA")) {
         files.push_back(std::filesystem::path{appdata} / L"shadPS4" / L"host_overrides.json");
     }
@@ -200,19 +212,6 @@ inline bool WriteCode(u64 address, const void* bytes, size_t size) {
     VirtualProtect(at, size, old, &ignored);
     FlushInstructionCache(GetCurrentProcess(), at, size);
     return true;
-}
-
-inline u64 ReadSlot(u64 address) {
-    return *reinterpret_cast<const volatile u64*>(address);
-}
-
-inline void WriteSlot(u64 address, u64 value) {
-    auto* slot = reinterpret_cast<volatile u64*>(address);
-    DWORD old = 0;
-    VirtualProtect(const_cast<u64*>(slot), 8, PAGE_READWRITE, &old);
-    *slot = value;
-    DWORD ignored = 0;
-    VirtualProtect(const_cast<u64*>(slot), 8, old, &ignored);
 }
 
 inline void* MapCodeAt(u64 address, u64 size) {

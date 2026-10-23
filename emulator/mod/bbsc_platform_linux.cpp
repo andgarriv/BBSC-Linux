@@ -142,8 +142,13 @@ std::vector<std::filesystem::path> HostOverridesFiles() {
         files.emplace_back(named);
     }
     std::error_code ignored;
-    files.push_back(std::filesystem::current_path(ignored) / "user" / "host_overrides.json");
-    files.push_back(ProgramPath().parent_path() / "user" / "host_overrides.json");
+    const std::filesystem::path start = std::filesystem::current_path(ignored);
+    const std::filesystem::path dir = ProgramPath().parent_path();
+    for (const auto& base : {start, dir, dir.parent_path()}) {
+        files.push_back(base / "user" / "host_overrides.custom.json");
+    }
+    files.push_back(start / "user" / "host_overrides.json");
+    files.push_back(dir / "user" / "host_overrides.json");
     return files;
 }
 
@@ -216,15 +221,18 @@ bool WriteCode(u64 address, const void* bytes, size_t size) {
     return true;
 }
 
-u64 ReadSlot(u64 address) {
-    u64 value = 0;
-    iovec local{&value, sizeof(value)};
-    iovec remote{reinterpret_cast<void*>(address), sizeof(value)};
-    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == sizeof(value) ? value : 0;
+bool ReadSlot(u64 address, u64* value) {
+    iovec local{value, sizeof(*value)};
+    iovec remote{reinterpret_cast<void*>(address), sizeof(*value)};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == sizeof(*value);
 }
 
-void WriteSlot(u64 address, u64 value) {
-    WriteProtected(address, &value, sizeof(value));
+bool WriteSlot(u64 address, u64 value) {
+    Region region;
+    if (!QueryRegion(address, region) || (region.prot & ProtRead) == 0) {
+        return false; // the emulator is still linking this page
+    }
+    return WriteProtected(address, &value, sizeof(value));
 }
 
 void* MapCodeAt(u64 address, u64 size) {
