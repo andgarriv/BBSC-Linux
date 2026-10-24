@@ -347,6 +347,36 @@ std::string JsonNumber(const std::string& body, const char* key) {
     return body.substr(at + needle.size(), end - at - needle.size());
 }
 
+// What a summon server matches a search against a sign with (2026-10-24, a Linux guest and a
+// Windows host never saw each other's sign): area, region, channel, sign type, matching level and
+// the password - the password only as set / not set. Logged when it changes, so the two players'
+// logs can be compared line by line.
+void LogMatchFields(const char* what, const std::string& body) {
+    std::string types;
+    for (size_t at = body.find("\"SummonType\":"); at != std::string::npos;
+         at = body.find("\"SummonType\":", at + 1)) {
+        types += (types.empty() ? "" : "/") + JsonNumber(body.substr(at), "SummonType");
+    }
+    auto field = [&](const char* key) {
+        const std::string value = JsonNumber(body, key);
+        return value.empty() ? std::string("-") : value;
+    };
+    const std::string line = fmt::format(
+        "AreaId {}, AreaRegionId {}, ChannelId {}, SummonType {}, MatchingLevel {}, password {}, "
+        "SummonDataVersion {}",
+        field("AreaId"), field("AreaRegionId"), field("ChannelId"), types.empty() ? "-" : types,
+        field("MatchingLevel"), JsonString(body, "SummonWord").empty() ? "none" : "set",
+        field("SummonDataVersion"));
+    static std::mutex mutex;
+    static std::map<std::string, std::string> last;
+    std::scoped_lock lock{mutex};
+    if (last[what] != line) {
+        last[what] = line;
+        LOG_INFO(Mod, "HTTP: {} matches on: {}", what, line);
+        BBSC_TIMELINE("JOIN", "HTTP: {} matches on: {}", what, line);
+    }
+}
+
 // One plain POST with WinHTTP (the stale-record delete). Returns the status code, 0 on failure.
 #ifdef _WIN32
 u32 Post(const std::string& url, const std::string& body) {
@@ -673,6 +703,10 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
         return original_send(request, data, size);
     }
     if (IsSummonSearch(url)) {
+        if (data != nullptr && size != 0) {
+            LogMatchFields("sign search", std::string(static_cast<const char*>(data),
+                                                      static_cast<size_t>(size)));
+        }
         return original_send(request, data, size); // searches go out unchanged (0.0.1 hotfix)
     }
     if (IsSummonCreate(url)) {
@@ -687,6 +721,7 @@ int PS4_SYSV_ABI SendRequest(int request, const void* data, u64 size) {
     }
     if (IsSummonCreate(url) && data != nullptr && size != 0) {
         std::string body(static_cast<const char*>(data), static_cast<size_t>(size));
+        LogMatchFields("our sign", body);
         ClearStaleRecord(url, body);
         if (const std::string user = JsonNumber(body, "UserId"); !user.empty()) {
             const s64 id = std::atoll(user.c_str());
