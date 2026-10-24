@@ -76,3 +76,5 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: BBSC-*-BBport-Linux.tar.gz
+          # v0.0.2-linux-pre.1 and the like: a pre-release (not shown as the latest release).
+          prerelease: ${{ contains(github.ref_name, '-pre') }}
