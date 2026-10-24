@@ -89,6 +89,8 @@ boss, a death of each player and the Hunter's Dream. Send both players' `bbsc-mo
 - Watching another hunter while dead (0.0.2): on Linux only the controller switches hunters
   (R1 / L1); the Tab / E / Q / F / mouse keys read the game window and are Windows only.
 - The Windows 0.0.2 package ships a patched BBport (`bbport/bbport-1.7.2-bbsc.patch`: UDP 3478
-  relay fallback, signaling rejoin fix, NpUtility). The Linux package runs the stock BBport
-  AppImage, without those network fixes; the mod side (aimed host placement, safe import slots,
-  area list cap, timeline) is the same.
+  relay fallback, signaling rejoin fix, NpUtility). Those fixes live in BBport's `libbbnet.so`,
+  not in the mod, so on Linux they come with the BBport AppImage itself: `bbsc-probe` writes at
+  start whether the one in use has them ("BBSC: this BBport has the BBSC network fixes"). Without
+  them players behind one router (two PCs on one Wi-Fi) or CGNAT may not connect. The mod side
+  (aimed host placement, safe import slots, area list cap, timeline) is the same as on Windows.

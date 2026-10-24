@@ -65,6 +65,18 @@ exec > >(while IFS= read -r line || [[ -n $line ]]; do
              printf '%s\n' "$line" >&"$console"
              printf '%s\n' "$line" >&"$game_log"
          done) 2>&1
+# BBSC's BBport network fixes (bbport/bbport-1.7.2-bbsc.patch: relay fallback over UDP 3478,
+# rejoin fix, NpUtility) are in bb-probe's libbbnet.so, not in the mod: say whether this BBport
+# has them (2026-10-24: two PCs on one Wi-Fi need the relay, routers rarely loop back).
+net_library=$tools/gpu/libbbnet.so
+if [[ -f $net_library ]] && command -v grep > /dev/null; then
+    if grep -qaF 'P2P relay fallback' "$net_library"; then
+        echo "BBSC: this BBport has the BBSC network fixes (P2P relay fallback)"
+    else
+        echo "BBSC: this BBport has NO P2P relay fallback - players behind one router or CGNAT" \
+             "may not connect; use a BBport build with bbport/bbport-1.7.2-bbsc.patch"
+    fi
+fi
 # Only bb-probe gets it: libbbsc.so takes itself out of LD_PRELOAD again once loaded.
 export LD_PRELOAD=$here/libbbsc.so${LD_PRELOAD:+:$LD_PRELOAD}
 "$probe" "$@" &
